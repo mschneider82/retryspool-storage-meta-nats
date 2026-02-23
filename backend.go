@@ -25,12 +25,14 @@ type StateCounters struct {
 
 // Backend implements metastorage.Backend using NATS JetStream Key-Value store
 type Backend struct {
-	conn         *nats.Conn
-	js           nats.JetStreamContext
-	kv           nats.KeyValue
-	bucket       string
-	ownConn      bool // Whether we own the connection and should close it
+	conn          *nats.Conn
+	js            nats.JetStreamContext
+	kv            nats.KeyValue
+	bucket        string
+	ownConn       bool // Whether we own the connection and should close it
 	stateCounters *StateCounters
+	mu            sync.RWMutex
+	closed        bool
 }
 
 // NewBackend creates a new NATS metadata storage backend
@@ -112,7 +114,7 @@ func (b *Backend) StoreMeta(ctx context.Context, messageID string, metadata meta
 	}
 
 	key := b.metadataKey(messageID)
-	
+
 	// Check if key exists first
 	_, err = b.kv.Get(key)
 	if err != nil {
@@ -167,7 +169,7 @@ func (b *Backend) GetMeta(ctx context.Context, messageID string) (metastorage.Me
 // UpdateMeta updates message metadata using atomic compare-and-swap
 func (b *Backend) UpdateMeta(ctx context.Context, messageID string, metadata metastorage.MessageMetadata) error {
 	key := b.metadataKey(messageID)
-	
+
 	// Get current entry with revision for compare-and-swap
 	currentEntry, err := b.kv.Get(key)
 	if err != nil {
@@ -252,7 +254,7 @@ func (b *Backend) DeleteMeta(ctx context.Context, messageID string) error {
 func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState, options metastorage.MessageListOptions) (metastorage.MessageListResult, error) {
 	// Get all keys for the given state using efficient Keys() with filter
 	statePrefix := b.statePrefix(state)
-	
+
 	// Use Keys() - much more efficient than WatchAll()
 	keys, err := b.kv.Keys(nats.IgnoreDeletes())
 	if err != nil {
@@ -266,7 +268,7 @@ func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState
 		}
 		return metastorage.MessageListResult{}, fmt.Errorf("failed to list keys for state %s: %w", state.String(), err)
 	}
-	
+
 	// Filter keys by prefix manually (still faster than WatchAll())
 	var filteredKeys []string
 	for _, key := range keys {
@@ -275,7 +277,7 @@ func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState
 		}
 	}
 	keys = filteredKeys
-	
+
 	if len(keys) == 0 {
 		return metastorage.MessageListResult{
 			MessageIDs: []string{},
@@ -373,15 +375,15 @@ type natsIterator struct {
 	state     metastorage.QueueState
 	batchSize int
 	ctx       context.Context
-	
+
 	// Current state
-	keys      []string
-	current   []metastorage.MessageMetadata
-	index     int
-	offset    int
-	finished  bool
-	closed    bool
-	mu        sync.RWMutex
+	keys     []string
+	current  []metastorage.MessageMetadata
+	index    int
+	offset   int
+	finished bool
+	closed   bool
+	mu       sync.RWMutex
 }
 
 // Next returns the next message metadata
@@ -423,7 +425,7 @@ func (it *natsIterator) loadBatch(ctx context.Context) error {
 
 	// Use Watch-based streaming instead of loading all keys at once
 	statePrefix := it.backend.statePrefix(it.state)
-	
+
 	// Create a watcher for the state prefix
 	watcher, err := it.backend.kv.Watch(statePrefix + "*")
 	if err != nil {
@@ -460,7 +462,7 @@ func (it *natsIterator) loadBatch(ctx context.Context) error {
 			continue // Skip malformed keys
 		}
 		messageID := parts[2]
-		
+
 		// Get the actual metadata using the message ID
 		metadata, err := it.backend.GetMeta(ctx, messageID)
 		if err != nil {
@@ -493,7 +495,7 @@ func (it *natsIterator) loadBatch(ctx context.Context) error {
 func (it *natsIterator) Close() error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
-	
+
 	it.closed = true
 	it.keys = nil
 	it.current = nil
@@ -502,8 +504,15 @@ func (it *natsIterator) Close() error {
 
 // MoveToState moves a message to a different queue state using atomic operations
 func (b *Backend) MoveToState(ctx context.Context, messageID string, fromState, toState metastorage.QueueState) error {
+	b.mu.RLock()
+	closed := b.closed
+	b.mu.RUnlock()
+	if closed {
+		return metastorage.ErrBackendClosed
+	}
+
 	key := b.metadataKey(messageID)
-	
+
 	// Retry loop for optimistic concurrency control
 	maxRetries := 3
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -511,7 +520,7 @@ func (b *Backend) MoveToState(ctx context.Context, messageID string, fromState, 
 		currentEntry, err := b.kv.Get(key)
 		if err != nil {
 			if err == nats.ErrKeyNotFound {
-				return fmt.Errorf("message %s not found", messageID)
+				return metastorage.ErrMessageNotFound
 			}
 			return fmt.Errorf("failed to get current metadata for message %s: %w", messageID, err)
 		}
@@ -525,7 +534,7 @@ func (b *Backend) MoveToState(ctx context.Context, messageID string, fromState, 
 
 		// Atomic check: ensure message is in expected fromState
 		if metadata.State != fromState {
-			return fmt.Errorf("message %s is in state %d, expected %d", messageID, int(metadata.State), int(fromState))
+			return metastorage.ErrStateConflict
 		}
 
 		// Check if state is already the target state
@@ -586,6 +595,14 @@ func (b *Backend) MoveToState(ctx context.Context, messageID string, fromState, 
 
 // Close closes the NATS connection if we own it
 func (b *Backend) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	b.mu.Unlock()
+
 	if b.stateCounters != nil {
 		b.stateCounters.cancel()
 		if b.stateCounters.watcher != nil {
@@ -615,7 +632,7 @@ func (b *Backend) stateIndexKey(state metastorage.QueueState, messageID string) 
 // initStateCounters initializes the state counters with NATS KeyValue watch
 func (b *Backend) initStateCounters() error {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	b.stateCounters = &StateCounters{
 		counters: make(map[metastorage.QueueState]int64),
 		ctx:      ctx,
@@ -692,7 +709,7 @@ func (b *Backend) processWatchEvents() {
 			}
 
 			queueState := parseQueueState(state)
-			
+
 			b.stateCounters.mu.Lock()
 			switch entry.Operation() {
 			case nats.KeyValuePut:
@@ -721,10 +738,10 @@ func (b *Backend) GetStateCount(state metastorage.QueueState) int64 {
 	if b.stateCounters == nil {
 		return 0
 	}
-	
+
 	b.stateCounters.mu.RLock()
 	defer b.stateCounters.mu.RUnlock()
-	
+
 	return b.stateCounters.counters[state]
 }
 
