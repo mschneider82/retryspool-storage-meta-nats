@@ -3,8 +3,8 @@ module schneider.vip/retryspool/storage/meta/nats
 go 1.24.0
 
 require (
-	github.com/nats-io/nats.go v1.48.0
-	schneider.vip/retryspool/storage/meta v0.0.3
+	github.com/nats-io/nats.go v1.49.0
+	schneider.vip/retryspool/storage/meta v0.0.4
 )
 
 require (
