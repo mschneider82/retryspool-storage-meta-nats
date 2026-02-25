@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/nats-io/nats.go v1.49.0
-	schneider.vip/retryspool/storage/meta v0.0.4
+	schneider.vip/retryspool/storage/meta v0.0.5
 )
 
 require (
