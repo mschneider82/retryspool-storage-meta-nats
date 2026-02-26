@@ -677,7 +677,7 @@ func (b *Backend) initCountersFromExistingKeys() error {
 		if strings.HasPrefix(key, "state.") {
 			state := b.extractStateFromKey(key)
 			if state != "" {
-				if queueState := parseQueueState(state); state == "incoming" || state == "active" || state == "deferred" || state == "hold" || state == "bounce" {
+				if queueState := parseQueueState(state); state == "incoming" || state == "active" || state == "deferred" || state == "hold" || state == "bounce" || state == "archived" {
 					b.stateCounters.counters[queueState]++
 				}
 			}
@@ -704,7 +704,7 @@ func (b *Backend) processWatchEvents() {
 			}
 
 			state := b.extractStateFromKey(key)
-			if state == "" || (state != "incoming" && state != "active" && state != "deferred" && state != "hold" && state != "bounce") {
+			if state == "" || (state != "incoming" && state != "active" && state != "deferred" && state != "hold" && state != "bounce" && state != "archived") {
 				continue
 			}
 
@@ -758,6 +758,8 @@ func parseQueueState(state string) metastorage.QueueState {
 		return metastorage.StateHold
 	case "bounce":
 		return metastorage.StateBounce
+	case "archived":
+		return metastorage.StateArchived
 	default:
 		return metastorage.QueueState(0) // Invalid state
 	}
