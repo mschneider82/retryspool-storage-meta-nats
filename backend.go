@@ -354,10 +354,18 @@ func (b *Backend) ListMessages(ctx context.Context, state metastorage.QueueState
 	}, nil
 }
 
-// NewMessageIterator creates an iterator for messages in a specific state
+// NewMessageIterator creates an iterator for messages in a specific state.
+// It creates a single KV watcher that is reused across all batch loads
+// and properly cleaned up in Close().
 func (b *Backend) NewMessageIterator(ctx context.Context, state metastorage.QueueState, batchSize int) (metastorage.MessageIterator, error) {
 	if batchSize <= 0 {
 		batchSize = 50 // Default batch size
+	}
+
+	statePrefix := b.statePrefix(state)
+	watcher, err := b.kv.Watch(statePrefix + "*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create watcher for state %s: %w", state.String(), err)
 	}
 
 	return &natsIterator{
@@ -365,22 +373,22 @@ func (b *Backend) NewMessageIterator(ctx context.Context, state metastorage.Queu
 		state:     state,
 		batchSize: batchSize,
 		ctx:       ctx,
-		offset:    0,
+		watcher:   watcher,
 	}, nil
 }
 
-// natsIterator implements MessageIterator for NATS backend
+// natsIterator implements MessageIterator for NATS backend.
+// Uses a single persistent KV watcher created at iterator construction time.
 type natsIterator struct {
 	backend   *Backend
 	state     metastorage.QueueState
 	batchSize int
 	ctx       context.Context
+	watcher   nats.KeyWatcher
 
 	// Current state
-	keys     []string
 	current  []metastorage.MessageMetadata
 	index    int
-	offset   int
 	finished bool
 	closed   bool
 	mu       sync.RWMutex
@@ -417,73 +425,59 @@ func (it *natsIterator) Next(ctx context.Context) (metastorage.MessageMetadata, 
 	return metadata, hasMore, nil
 }
 
-// loadBatch loads the next batch of messages using streaming approach
+// loadBatch reads the next batch of messages from the persistent watcher.
+// No new JetStream consumer is created — the watcher remembers its position.
 func (it *natsIterator) loadBatch(ctx context.Context) error {
 	if it.finished {
 		return nil
 	}
 
-	// Use Watch-based streaming instead of loading all keys at once
-	statePrefix := it.backend.statePrefix(it.state)
-
-	// Create a watcher for the state prefix
-	watcher, err := it.backend.kv.Watch(statePrefix + "*")
-	if err != nil {
-		return fmt.Errorf("failed to create watcher for state %s: %w", it.state.String(), err)
-	}
-	defer watcher.Stop()
-
-	// Collect batch of messages
 	var batch []metastorage.MessageMetadata
 	collected := 0
-	skipped := 0
 
-	// Process watch updates to get current state
-	for update := range watcher.Updates() {
-		if update == nil {
-			break // No more updates
-		}
+	updates := it.watcher.Updates()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case update, ok := <-updates:
+			if !ok || update == nil {
+				it.finished = true
+				goto done
+			}
 
-		// Skip deleted entries
-		if update.Operation() == nats.KeyValueDelete {
-			continue
-		}
+			// Skip deleted entries
+			if update.Operation() == nats.KeyValueDelete {
+				continue
+			}
 
-		// Skip entries we've already processed (offset-based)
-		if skipped < it.offset {
-			skipped++
-			continue
-		}
+			// Extract message ID from state index key
+			key := update.Key()
+			parts := strings.Split(key, ".")
+			if len(parts) < 3 {
+				continue // Skip malformed keys
+			}
+			messageID := parts[2]
 
-		// Extract message ID from state index key
-		key := update.Key()
-		parts := strings.Split(key, ".")
-		if len(parts) < 3 {
-			continue // Skip malformed keys
-		}
-		messageID := parts[2]
+			// Get the actual metadata using the message ID
+			metadata, err := it.backend.GetMeta(ctx, messageID)
+			if err != nil {
+				continue // Skip if metadata not found
+			}
 
-		// Get the actual metadata using the message ID
-		metadata, err := it.backend.GetMeta(ctx, messageID)
-		if err != nil {
-			continue // Skip if metadata not found
-		}
+			batch = append(batch, metadata)
+			collected++
 
-		batch = append(batch, metadata)
-		collected++
-
-		// Stop when we have enough for this batch
-		if collected >= it.batchSize {
-			break
+			if collected >= it.batchSize {
+				goto done
+			}
 		}
 	}
+done:
 
-	// Update iterator state
 	it.current = batch
 	it.index = 0
-	it.offset += len(batch)
 
-	// Mark as finished if we got fewer messages than requested
 	if len(batch) < it.batchSize {
 		it.finished = true
 	}
@@ -491,13 +485,19 @@ func (it *natsIterator) loadBatch(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the iterator
+// Close closes the iterator and stops the underlying KV watcher.
 func (it *natsIterator) Close() error {
 	it.mu.Lock()
 	defer it.mu.Unlock()
 
+	if it.closed {
+		return nil
+	}
 	it.closed = true
-	it.keys = nil
+	if it.watcher != nil {
+		it.watcher.Stop()
+		it.watcher = nil
+	}
 	it.current = nil
 	return nil
 }
@@ -629,7 +629,9 @@ func (b *Backend) stateIndexKey(state metastorage.QueueState, messageID string) 
 	return fmt.Sprintf("state.%s.%s", state.String(), messageID)
 }
 
-// initStateCounters initializes the state counters with NATS KeyValue watch
+// initStateCounters initializes the state counters with NATS KeyValue watch.
+// Builds initial counts synchronously from the WatchAll replay (waits for nil sentinel),
+// then starts a background goroutine for live updates.
 func (b *Backend) initStateCounters() error {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -639,50 +641,40 @@ func (b *Backend) initStateCounters() error {
 		cancel:   cancel,
 	}
 
-	// Initialize counters by counting existing keys
-	if err := b.initCountersFromExistingKeys(); err != nil {
-		cancel()
-		return fmt.Errorf("failed to initialize counters from existing keys: %w", err)
-	}
-
-	// Start watching for changes (including deletes for state counting)
 	watcher, err := b.kv.WatchAll()
 	if err != nil {
 		cancel()
 		return fmt.Errorf("failed to create watch: %w", err)
 	}
-
 	b.stateCounters.watcher = watcher
 
-	// Start background goroutine to process watch events
+	// Synchronously consume the initial replay to build accurate counters.
+	// WatchAll delivers all current values as KeyValuePut events, then a nil sentinel.
+	// No lock needed: the background goroutine is not started yet and no other
+	// code can access stateCounters until this function returns.
+	for entry := range watcher.Updates() {
+		if entry == nil {
+			break // Initial sync done
+		}
+		if entry.Operation() != nats.KeyValuePut {
+			continue
+		}
+		key := entry.Key()
+		if !strings.HasPrefix(key, "state.") {
+			continue
+		}
+		state := b.extractStateFromKey(key)
+		if state == "" {
+			continue
+		}
+		queueState := parseQueueState(state)
+		if queueState != 0 {
+			b.stateCounters.counters[queueState]++
+		}
+	}
+
+	// Background goroutine only processes live updates from this point on
 	go b.processWatchEvents()
-
-	return nil
-}
-
-// initCountersFromExistingKeys counts existing state keys to initialize counters
-func (b *Backend) initCountersFromExistingKeys() error {
-	keys, err := b.kv.Keys(nats.IgnoreDeletes())
-	if err != nil {
-		if err.Error() == "nats: no keys found" {
-			return nil // No existing keys, start with zero counts
-		}
-		return fmt.Errorf("failed to list existing keys: %w", err)
-	}
-
-	b.stateCounters.mu.Lock()
-	defer b.stateCounters.mu.Unlock()
-
-	for _, key := range keys {
-		if strings.HasPrefix(key, "state.") {
-			state := b.extractStateFromKey(key)
-			if state != "" {
-				if queueState := parseQueueState(state); state == "incoming" || state == "active" || state == "deferred" || state == "hold" || state == "bounce" || state == "archived" {
-					b.stateCounters.counters[queueState]++
-				}
-			}
-		}
-	}
 
 	return nil
 }
